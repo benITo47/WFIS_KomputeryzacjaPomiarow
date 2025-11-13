@@ -3,33 +3,23 @@
  SCHEMAT POŁĄCZEŃ SPRZĘTOWYCH (ARDUINO <-> KOMPONENTY)
 --------------------------------------------------------------------------------
 
-Ten skrypt steruje systemem o poniższej konfiguracji:
+### Arduino <-> Czujnik Wilgotności (Sensor)
+- **Połączenia:**
+  - `Arduino 3.3V` -> `VCC` czujnika
+  - `Arduino GND`  -> `GND` czujnika
+  - `Arduino A0`   -> `AOUT` czujnika
 
-1. Arduino <-> Czujnik Wilgotności (Sensor)
-   ------------------------------------------
-   - Cel: Odczyt poziomu wilgotności gleby.
-   - Połączenia:
-     - Arduino 3.3V -> VCC czujnika (Zasilanie czujnika)
-     - Arduino GND  -> GND czujnika (Wspólna masa)
-     - Arduino A0   -> AOUT czujnika (Sygnał analogowy z wilgotnością)
+### Arduino <-> Moduł Przekaźnika (Relay Module)
+- **Połączenia:**
+  - `Arduino 5V`   -> `VCC` przekaźnika
+  - `Arduino GND`  -> `GND` przekaźnika
+  - `Arduino D7`   -> `IN1` przekaźnika (steruje kanałem **K1**)
 
-2. Arduino <-> Moduł Przekaźnika (Relay Module)
-   ---------------------------------------------
-   - Cel: Sterowanie włączaniem/wyłączaniem pompy.
-   - Połączenia:
-     - Arduino 5V   -> VCC przekaźnika (Zasilanie logiki przekaźnika)
-     - Arduino GND  -> GND przekaźnika (Wspólna masa)
-     - Arduino D7   -> IN1 przekaźnika (Sygnał sterujący dla pierwszego kanału, czyli K1)
-
-3. Układ Zasilania Pompy (Pump Power Circuit)
-   ------------------------------------------
-   - Cel: Bezpieczne zasilanie pompy z użyciem zewnętrznego źródła, 
-     przekaźnik działa jako elektroniczny przełącznik.
-   - Komponenty: Pompa, zewnętrzne źródło zasilania (np. zasilacz 5V/12V).
-   - Połączenia:
-     - Zasilacz (+) -> Pompa (+)         [Bezpośrednie połączenie plusów]
-     - Zasilacz (-) -> Przekaźnik COM    [Minus zasilania do wejścia wspólnego przekaźnika K1]
-     - Pompa (-)    -> Przekaźnik NO     [Minus pompy do wyjścia "Normalnie Otwartego" przekaźnika K1]
+### Układ Zasilania Pompy (Pump Power Circuit)
+- **Połączenia:**
+  - `Zasilacz (+)` -> `Pompa (+)`
+  - `Zasilacz (-)` -> `Przekaźnik COM` (na kanale **K1**)
+  - `Pompa (-)`    -> `Przekaźnik NO` (na kanale **K1**)
 
 --------------------------------------------------------------------------------
 */
@@ -37,15 +27,15 @@ Ten skrypt steruje systemem o poniższej konfiguracji:
 #include <PID_v1.h> // Dołączamy bibliotekę PID
 
 /*
- * Zaawansowany program do automatycznego nawadniania z użyciem kontrolera PID.
- * Wysyła dane w formacie CSV (wilgotnosc,cel,wyjscie_pid) do wizualizacji w Pythonie.
+ * - Sterowanie parametrami PID i Setpoint na żywo przez port szeregowy.
+ * - Wysyła dane w formacie CSV (wilgotnosc,cel,wyjscie_pid) do wizualizacji w Pythonie.
  */
 
 // --- Konfiguracja Pinów ---
 const int SENSOR_PIN_AOUT = A0;  // Wejście analogowe dla czujnika wilgotności
 const int RELAY_PIN = 7;         // Pin cyfrowy do sterowania przekaźnikiem (IN1)
 
-// --- Kalibracja Czujnika (Twoje wartości z testów) ---
+// --- Kalibracja Czujnika ---
 const int ADC_MIN_HUMIDITY = 466; // Wartość dla SUCHEGO czujnika
 const int ADC_MAX_HUMIDITY = 315; // Wartość dla MOKREGO czujnika
 
@@ -57,12 +47,15 @@ double Kp = 5, Ki = 0.1, Kd = 1;
 PID myPID(&Input, &Output, &Setpoint, Kp, Ki, Kd, DIRECT);
 
 // --- Ustawienia Czasowe dla Pompy (PWM) ---
-unsigned long windowSize = 10000; // Długość okna czasowego w milisekundach (np. 10 sekund)
+unsigned long windowSize = 10000; 
 unsigned long windowStartTime;
+
+// --- Bufor do komunikacji szeregowej ---
+String serialBuffer = "";
 
 void setup() {
   Serial.begin(9600);
-  Serial.println("Start programu - Nawadnianie z kontrolerem PID");
+  serialBuffer.reserve(32); // Rezerwujemy pamięć dla komend
 
   pinMode(SENSOR_PIN_AOUT, INPUT);
   pinMode(RELAY_PIN, OUTPUT);
@@ -73,16 +66,15 @@ void setup() {
 }
 
 void loop() {
-  // 1. Odczytaj i przelicz wilgotność
+  handleSerialCommands();
+  
   int sensorValue = analogRead(SENSOR_PIN_AOUT);
   int humidity = map(sensorValue, ADC_MIN_HUMIDITY, ADC_MAX_HUMIDITY, 0, 100);
   humidity = constrain(humidity, 0, 100);
   Input = humidity;
 
-  // 2. Uruchom obliczenia PID
   myPID.Compute();
 
-  // 3. Steruj pompą na podstawie wyniku PID
   unsigned long now = millis();
   if (now - windowStartTime > windowSize) {
     windowStartTime += windowSize;
@@ -93,12 +85,44 @@ void loop() {
     digitalWrite(RELAY_PIN, HIGH);
   }
 
-  // 4. Wysyłamy dane w formacie CSV dla Pythona: wilgotnosc,cel,wyjscie_pid
   Serial.print(Input);
   Serial.print(",");
   Serial.print(Setpoint);
   Serial.print(",");
   Serial.println(Output);
   
-  delay(200); // Czekamy chwilę, aby dane były wysyłane w rozsądnym tempie
+  delay(200);
+}
+
+void handleSerialCommands() {
+  while (Serial.available() > 0) {
+    char receivedChar = Serial.read();
+    if (receivedChar == '\n') {
+      parseCommand(serialBuffer);
+      serialBuffer = ""; // Czyścimy bufor
+    } else {
+      serialBuffer += receivedChar;
+    }
+  }
+}
+
+void parseCommand(String command) {
+  char commandType = command.charAt(0);
+  float value = command.substring(2).toFloat();
+
+  switch (commandType) {
+    case 'P':
+      Kp = value;
+      break;
+    case 'I':
+      Ki = value;
+      break;
+    case 'D':
+      Kd = value;
+      break;
+    case 'S':
+      Setpoint = value;
+      return; // Dla Setpoint nie trzeba aktualizować nastaw PID
+  }
+  myPID.SetTunings(Kp, Ki, Kd);
 }
